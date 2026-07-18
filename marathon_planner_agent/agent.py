@@ -22,7 +22,7 @@ tools = []
 
 # # TODO: Replace Instruction and Description Prompt only
 instruction=PLANNER_INSTRUCTION_NO_TOOLS
-description="Expert GIS analyst for marathon route and event planning."
+description="Running route planner for park runs, training loops, and optional race events."
 
 # # TODO: Replaces Tools
 instruction=PLANNER_INSTRUCTION

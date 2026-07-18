@@ -1,9 +1,10 @@
 ---
 name: gis-spatial-engineering
 description:
-  Expert GIS tools for generating mathematically perfect marathon routes of exactly
-  42.195 km using road network data and zone-sweep decomposition. Always report
-  distances in kilometers (km).
+  Expert GIS tools for generating runnable routes (casual jog, training loop,
+  5K/10K, Lumphini heart shape, park connector, or race course) on the Bangkok
+  Lumphini↔Benjakitti road network. Always report distances in kilometers (km).
+  Not limited to marathons.
 metadata:
   adk_additional_tools:
     - plan_marathon_route
@@ -13,16 +14,16 @@ metadata:
 
 # Route Planning
 
-You use this skill to generate the physical path of the marathon.
+You use this skill to generate a **physical running path** of any reasonable
+shape for the built-in Bangkok park network — not only marathons.
 
 ## Units (important)
 
 - **Always use kilometers (km)** when talking to the user — never miles.
-- Official marathon distance: **42.195 km** (equivalent to 26.2 miles internally).
-- Half marathon: **21.0975 km**.
-- Hydration stations: about every **5 km**.
-- When tools return `mi` / `distance_mi`, convert to km before answering:
-  `km = mi × 1.60934`. Round to 1–2 decimal places (e.g. `42.20 km`).
+- Common distances (examples, not requirements):
+  - Easy park loop / connector: ~5–12 km (default planner target ≈ **10 km**)
+  - 5K ≈ 5.0 km · 10K ≈ 10.0 km · half ≈ 21.1 km · marathon ≈ 42.195 km
+- When tools return `mi` / `distance_mi`, convert: `km = mi × 1.60934`.
 
 ## Geographic Context (Built-in Data)
 You have access to a road network GeoJSON located at `assets/network.json`
@@ -38,44 +39,41 @@ Key features:
 
 ## Algorithm
 
-The default algorithm is **zone-sweep**: the route starts near
-`Lumphini Park South Gate`, travels the Witthayu corridor toward
-`Sarasin Junction`, and finishes at `Benjakitti Park`.
-The algorithm handles route geometry automatically — you do not need to
-select petals or manually sequence landmarks.
+- **Default (Bangkok):** park-connector landmark chain
+  (`Lumphini` → Witthayu / Sarasin → Green Mile → `Benjakitti`), with optional
+  loops for distance. Vary with `seed` and `start_landmark`.
+- **Heart inside Lumphini only:** `route_shape="heart"` (or `algorithm="park_heart"`).
+  Stays on park footpaths (no Rama IV / Witthayu arterials), traces a heart
+  loop (~2.5–3 km per lap) and repeats until `target_distance_km` (e.g. 10).
+  Use this when the user asks for รูปหัวใจ / ภายในสวนลุมพินีเท่านั้น.
 
-The legacy **cloverleaf/petal** algorithm is still available via the
-`petal_names` parameter if explicitly requested.
+Legacy **zone-sweep** / **cloverleaf** params still exist on the tool but are
+Las Vegas–oriented; prefer defaults or `route_shape="heart"` for Bangkok park runs.
 
 ## Instructions
 
-1. **Just call it**: `plan_marathon_route()` with no arguments produces a valid
-   Bangkok park-connector route (~**10 km** target for this clipped network).
-   Use `start_landmark` and `seed` for variety.
-2. **Precision**: For this Lumphini–Benjakitti frame the planner targets **10 km**
-   (not a full 42.195 km marathon — the map area is too small for that without
-   heavy backtracking). Report the actual `distance_km` from the tool summary.
-3. **GeoJSON**: Input must be valid road network GeoJSON.
-4. **Report in km**: Summaries, station spacing, and route length must use **km**.
-5. After planning, **always** call `report_marathon_route` for the map artifact.
+1. Call `plan_marathon_route(...)` with the right shape:
+   - Heart / Lumphini-only → `route_shape="heart", target_distance_km=10`
+   - General park connector → defaults (`start_landmark` / `seed` optional)
+2. Report the actual `distance_km` from the tool summary — do not invent 42.195 km
+   unless the route really is that long.
+3. After planning, **always** call `report_marathon_route` for the map artifact.
+4. If the user only wants a route map (not a race), do not push event logistics.
+
 ## Tools
 
-- `plan_marathon_route(algorithm: str = "zone_sweep", start_landmark: Optional[str] = None, seed: Optional[int] = None, petal_names: Optional[list[str]] = None, geojson_data: Optional[str] = None)`:
-  Generate the exact 42.195 km path.
-  - `algorithm`: `"zone_sweep"` (default) or `"cloverleaf"`.
-  - `start_landmark`: Name of a landmark to start near (e.g., `"Benjakitti Park"`). Zone-sweep only.
-  - `seed`: Integer seed for route variety. Different seeds produce different routes. Zone-sweep only.
-  - `petal_names`: List of petal names. Cloverleaf algorithm only.
-- `add_water_stations(route_geojson: dict)`: Append water station features (about every 5 km).
-- `add_medical_tents(route_geojson: dict)`: Append medical tent features.
-- `report_marathon_route(route_geojson: dict)`: Emit the final GeoJSON **and**
-  save an interactive Leaflet map as ADK HTML artifact `marathon_route_map.html`
-  so it renders in `adk web`. Always call this after planning so the user can see the map.
+- `plan_marathon_route(route_shape: Optional[str] = None, target_distance_km: Optional[float] = None, start_landmark: Optional[str] = None, seed: Optional[int] = None, algorithm: str = "zone_sweep", ...)`:
+  Generate a runnable path on the loaded network.
+  - `route_shape="heart"`: multi-lap heart **inside Lumphini Park only**.
+  - `target_distance_km`: e.g. `10` for a 10K (default ≈ 10 km on Bangkok net).
+  - `start_landmark`: e.g. `"Lumphini Park South Gate"`.
+  - `seed`: Integer for route variety.
+- `report_marathon_route()`: Save interactive Leaflet map artifact
+  `marathon_route_map_<seed>.html` for ADK Web (new file each replan).
 
 ### Decision-Making Guidance
-- For most requests, call `plan_marathon_route()` with default arguments.
-- Use `seed` to generate alternative routes when the user wants variety.
-- Use `start_landmark` when the user specifies a preferred starting area.
-- Only use `petal_names` if the user explicitly asks for the cloverleaf/petal approach.
-- Always present distances to the user in **km**.
-- After a successful plan, **always** call `report_marathon_route` so the map artifact appears in the UI.
+- Casual run / training → plan + map + short summary.
+- **Heart / ในสวนลุมเท่านั้น** → must use `route_shape="heart"` (do not use park-connector).
+- Race event → plan + map, then race-director skill for logistics.
+- Always present distances in **km**.
+- Always call `report_marathon_route` after a successful plan.

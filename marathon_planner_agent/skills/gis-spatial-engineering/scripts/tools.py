@@ -67,6 +67,21 @@ CORRIDOR_ROAD = "Witthayu Road"
 # Default finish landmark
 FINISH_LANDMARK = "Benjakitti Park"
 
+# Lumphini Park interior (exclude surrounding arterials) — lon_min, lat_min, lon_max, lat_max
+LUMPHINI_PARK_BBOX = (100.5398, 13.7288, 100.5462, 13.7335)
+_LUMPHINI_ARTERIAL_HINTS = (
+    "rama iv",
+    "witthayu",
+    "wireless",
+    "ratchadamri",
+    "sarasin",
+)
+
+# Heart fitted to Lumphini (tip ≈ Rama VI / South Gate). Used as curve center/scale.
+_LUMPHINI_HEART_CENTER = (100.54275, 13.73105)
+_LUMPHINI_HEART_SCALE_LON = 0.00270  # half-width in degrees
+_LUMPHINI_HEART_SCALE_LAT = 0.00195  # half-height in degrees
+
 
 PETAL_CATALOG: Dict[str, dict] = {
     # --- West petals (radiate west from the Strip) ---
@@ -1408,40 +1423,364 @@ def _active_target_dist_mi() -> float:
     return BANGKOK_TARGET_DIST_MI if _is_bangkok_network() else TARGET_DIST_MI
 
 
+def _largest_connected_subgraph(
+    adj: Dict[tuple, List[tuple]],
+) -> Dict[tuple, List[tuple]]:
+    """Keep only the largest connected component of an adjacency graph."""
+    if not adj:
+        return {}
+    from collections import deque
+
+    seen: Set[tuple] = set()
+    best: Set[tuple] = set()
+    for start in adj:
+        if start in seen:
+            continue
+        q: deque[tuple] = deque([start])
+        seen.add(start)
+        comp: Set[tuple] = {start}
+        while q:
+            u = q.popleft()
+            for v, _ in adj.get(u, []):
+                if v not in seen:
+                    seen.add(v)
+                    comp.add(v)
+                    q.append(v)
+        if len(comp) > len(best):
+            best = comp
+    return {
+        n: [(v, w) for v, w in nbrs if v in best]
+        for n, nbrs in adj.items()
+        if n in best
+    }
+
+
+def _filter_lumphini_park_graph(
+    adj: Dict[tuple, List[tuple]],
+    road_names: Dict[tuple, str],
+) -> Dict[tuple, List[tuple]]:
+    """Restrict the graph to runnable paths inside Lumphini Park only."""
+    lon_min, lat_min, lon_max, lat_max = LUMPHINI_PARK_BBOX
+    filtered: Dict[tuple, List[tuple]] = {}
+    for u, nbrs in adj.items():
+        if not (lon_min <= u[0] <= lon_max and lat_min <= u[1] <= lat_max):
+            continue
+        kept: List[tuple] = []
+        for v, dist in nbrs:
+            if not (lon_min <= v[0] <= lon_max and lat_min <= v[1] <= lat_max):
+                continue
+            edge = tuple(sorted((u, v)))
+            name = (road_names.get(edge) or "").lower()
+            if name and any(h in name for h in _LUMPHINI_ARTERIAL_HINTS):
+                continue
+            kept.append((v, dist))
+        if kept:
+            filtered[u] = kept
+    return _largest_connected_subgraph(filtered)
+
+
+def _parametric_heart_lonlat(
+    n: int = 120,
+    center: tuple[float, float] = _LUMPHINI_HEART_CENTER,
+    scale_lon: float = _LUMPHINI_HEART_SCALE_LON,
+    scale_lat: float = _LUMPHINI_HEART_SCALE_LAT,
+) -> list[tuple[float, float]]:
+    """Classic parametric heart mapped into Lumphini lon/lat (tip at south)."""
+    pts: list[tuple[float, float]] = []
+    for i in range(n):
+        t = 2.0 * math.pi * i / n
+        # Standard heart curve; tip at bottom (min y)
+        x = 16.0 * (math.sin(t) ** 3)
+        y = (
+            13.0 * math.cos(t)
+            - 5.0 * math.cos(2.0 * t)
+            - 2.0 * math.cos(3.0 * t)
+            - math.cos(4.0 * t)
+        )
+        lon = center[0] + (x / 16.0) * scale_lon
+        lat = center[1] + (y / 17.0) * scale_lat
+        pts.append((lon, lat))
+    pts.append(pts[0])
+    return pts
+
+
+def _point_to_segment_dist_mi(
+    p: tuple[float, float],
+    a: tuple[float, float],
+    b: tuple[float, float],
+) -> float:
+    """Approximate distance from point to segment using local degrees→miles."""
+    # Local equirectangular in miles near Bangkok
+    lat0 = math.radians((a[1] + b[1] + p[1]) / 3.0)
+    ax, ay = a[0] * math.cos(lat0), a[1]
+    bx, by = b[0] * math.cos(lat0), b[1]
+    px, py = p[0] * math.cos(lat0), p[1]
+    abx, aby = bx - ax, by - ay
+    apx, apy = px - ax, py - ay
+    ab2 = abx * abx + aby * aby
+    t = 0.0 if ab2 < 1e-18 else max(0.0, min(1.0, (apx * abx + apy * aby) / ab2))
+    cx, cy = ax + t * abx, ay + t * aby
+    # degrees → miles (~69 mi per deg lat)
+    return math.hypot(px - cx, py - cy) * 69.0
+
+
+def _dijkstra_along_guide(
+    start: tuple,
+    end: tuple,
+    adj: Dict[tuple, List[tuple]],
+    guide_a: tuple[float, float],
+    guide_b: tuple[float, float],
+    pull: float = 12.0,
+) -> tuple[List[tuple], float]:
+    """Shortest path that stays near the guide segment (preserves heart outline)."""
+    import heapq
+
+    queue: list[tuple[float, float, tuple]] = [(0.0, 0.0, start)]  # (cost, true_dist, node)
+    best_cost: dict[tuple, float] = {start: 0.0}
+    true_dist: dict[tuple, float] = {start: 0.0}
+    prev: dict[tuple, tuple] = {}
+
+    while queue:
+        cost, dist, curr = heapq.heappop(queue)
+        if curr == end:
+            break
+        if cost > best_cost.get(curr, float("inf")):
+            continue
+        for neighbor, d in adj.get(curr, []):
+            # Penalize edges that leave the heart outline
+            off = _point_to_segment_dist_mi(neighbor, guide_a, guide_b)
+            step_cost = d * (1.0 + pull * off)
+            new_cost = cost + step_cost
+            if new_cost < best_cost.get(neighbor, float("inf")):
+                best_cost[neighbor] = new_cost
+                true_dist[neighbor] = dist + d
+                prev[neighbor] = curr
+                heapq.heappush(queue, (new_cost, dist + d, neighbor))
+
+    if end not in true_dist:
+        return [], 0.0
+    path = [end]
+    cur = end
+    hops = 0
+    while cur != start and hops < 5000:
+        cur = prev[cur]
+        path.append(cur)
+        hops += 1
+    path.reverse()
+    return path, true_dist[end]
+
+
+def _follow_guide_on_graph(
+    guide: list[tuple[float, float]],
+    adj: Dict[tuple, List[tuple]],
+    nodes: Set[tuple],
+    arrive_mi: float = 0.035,
+    max_steps: int = 4000,
+) -> tuple[list[tuple], float]:
+    """Walk park edges while chasing a guide curve with strict forward progress.
+
+    Only steps to a neighbor that gets closer to the current guide target.
+    If stuck, short-path snap to the target node and advance the guide index.
+    """
+    if not guide:
+        return [], 0.0
+    current = _find_closest_node(guide[0], nodes)
+    if current is None:
+        return [], 0.0
+
+    route: list[tuple] = [current]
+    total = 0.0
+    gi = 1
+    steps = 0
+
+    while gi < len(guide) and steps < max_steps:
+        steps += 1
+        target = guide[gi]
+        cur_d = _haversine(current, target)
+        if cur_d <= arrive_mi:
+            gi += 1
+            continue
+
+        nbrs = adj.get(current, [])
+        progress: list[tuple[float, float, tuple]] = []
+        for n, edge_d in nbrs:
+            nd = _haversine(n, target)
+            if nd < cur_d - 1e-7:
+                progress.append((nd, edge_d, n))
+
+        if progress:
+            progress.sort(key=lambda x: (x[0], x[1]))
+            _, edge_d, best_n = progress[0]
+            total += edge_d
+            route.append(best_n)
+            current = best_n
+            continue
+
+        # Stuck: jump toward this guide point, then advance
+        snap = _find_closest_node(target, nodes)
+        if snap is None or snap == current:
+            gi += 1
+            continue
+        path, dist = _get_path_dijkstra_park(current, snap, adj)
+        if path and len(path) >= 2 and dist <= 0.18:
+            for p in path[1:]:
+                total += _haversine(route[-1], p)
+                route.append(p)
+            current = route[-1]
+        # Always advance guide after a snap attempt to avoid infinite orbits
+        gi += 1
+
+    return route, total
+
+
+def _generate_lumphini_heart_route(
+    adj: Dict[tuple, List[tuple]],
+    landmarks: Dict[str, tuple],
+    road_names: Dict[tuple, str],
+    rng: random.Random,
+    target_mi: float | None = None,
+    start_landmark: str | None = None,
+) -> tuple[list[tuple], float, list[tuple], float, int]:
+    """Heart-shaped route on Lumphini park paths only.
+
+    Returns ``(map_coords, reported_dist_mi, lap_coords, lap_mi, laps)``.
+    ``map_coords`` is a **single** clean heart lap (so the artifact looks like a
+    heart). ``reported_dist_mi`` stacks identical laps to reach the target.
+    """
+    park_adj = _filter_lumphini_park_graph(adj, road_names)
+    if len(park_adj) < 20:
+        logger.warning("PLANNER: Lumphini park subgraph too small (%d nodes)", len(park_adj))
+        return [], 0.0, [], 0.0, 0
+
+    park_nodes = set(park_adj.keys())
+    target = target_mi if target_mi is not None else _active_target_dist_mi()
+
+    scale_lon = _LUMPHINI_HEART_SCALE_LON * rng.uniform(0.99, 1.04)
+    scale_lat = _LUMPHINI_HEART_SCALE_LAT * rng.uniform(0.99, 1.04)
+    center = (
+        _LUMPHINI_HEART_CENTER[0] + rng.uniform(-0.00003, 0.00003),
+        _LUMPHINI_HEART_CENTER[1] + rng.uniform(-0.00002, 0.00002),
+    )
+    guide = _parametric_heart_lonlat(
+        n=180, center=center, scale_lon=scale_lon, scale_lat=scale_lat
+    )
+
+    # Start at tip (south) near South Gate when possible
+    start_name = start_landmark or CORRIDOR_START
+    tip_hint = landmarks.get(start_name) or min(guide, key=lambda p: p[1])
+    tip_i = min(range(len(guide)), key=lambda i: _haversine(guide[i], tip_hint))
+    guide = guide[tip_i:-1] + guide[:tip_i] + [guide[tip_i]]
+
+    lap, lap_dist = _follow_guide_on_graph(guide, park_adj, park_nodes)
+    if len(lap) < 40 or lap_dist < 1.0:
+        logger.warning(
+            "PLANNER: Heart follow failed (pts=%d dist=%.3f mi)", len(lap), lap_dist
+        )
+        return [], 0.0, [], 0.0, 0
+
+    # Close the loop back to start
+    if lap[0] != lap[-1]:
+        path, dist = _get_path_dijkstra_park(lap[-1], lap[0], park_adj)
+        if path and len(path) >= 2 and dist < 0.35:
+            for p in path[1:]:
+                lap_dist += _haversine(lap[-1], p)
+                lap.append(p)
+        else:
+            lap_dist += _haversine(lap[-1], lap[0])
+            lap.append(lap[0])
+
+    laps = max(1, int(math.ceil(target / max(lap_dist, 1e-6))))
+    laps = min(laps, 12)
+    reported = lap_dist * laps
+
+    logger.info(
+        "PLANNER: Lumphini HEART map-lap %.2f km × %d = %.1f km (%d pts)",
+        lap_dist * 1.60934,
+        laps,
+        reported * 1.60934,
+        len(lap),
+    )
+    # Map shows one clean lap; distance is multi-lap
+    return lap, reported, lap, lap_dist, laps
+
+
+def _get_path_dijkstra_park(
+    start: tuple,
+    end: tuple,
+    adj: Dict[tuple, List[tuple]],
+) -> tuple[List[tuple], float]:
+    """Dijkstra that allows revisiting graph nodes (park grids are dense/loopy)."""
+    import heapq
+
+    queue: list[tuple[float, tuple]] = [(0.0, start)]
+    best: dict[tuple, float] = {start: 0.0}
+    prev: dict[tuple, tuple] = {}
+    while queue:
+        dist, curr = heapq.heappop(queue)
+        if curr == end:
+            break
+        if dist > best.get(curr, float("inf")):
+            continue
+        for neighbor, d in adj.get(curr, []):
+            new_cost = dist + d
+            if new_cost < best.get(neighbor, float("inf")):
+                best[neighbor] = new_cost
+                prev[neighbor] = curr
+                heapq.heappush(queue, (new_cost, neighbor))
+    if end not in best:
+        return [], 0.0
+    path = [end]
+    cur = end
+    while cur != start:
+        cur = prev[cur]
+        path.append(cur)
+    path.reverse()
+    return path, best[end]
+
+
 def _generate_park_connector_route(
     adj: Dict[tuple, List[tuple]],
     landmarks: Dict[str, tuple],
     strip_nodes: Set[tuple],
     rng: random.Random,
     finish_landmark: str | None = None,
+    start_landmark: str | None = None,
 ) -> tuple[list[tuple], float]:
-    """Build a reliable urban park-connector route (Lumphini → Benjakitti).
+    """Build a Bangkok park-connector route with seed-based variety.
 
-    Unlike zone-sweep (designed for Las Vegas scale), this chains landmark
-    waypoints with plain Dijkstra and optionally adds extra loops until the
-    Bangkok target distance (~10 km) is reached.
+    Chains landmarks with Dijkstra. ``rng`` shuffles optional midpoints and
+    loop direction so different seeds produce visibly different maps.
     """
     finish_name = finish_landmark or FINISH_LANDMARK
-    chain = [
-        CORRIDOR_START,
-        "Lumphini Park",
-        CORRIDOR_EXIT,
-        "The Green Mile",
-        "Green Bridge Midpoint",
-        finish_name,
-        "Queen Sirikit National Convention Center",
-        finish_name,
+    start_name = start_landmark or CORRIDOR_START
+
+    # Midpoints shuffled by seed → different path shapes each run
+    mid_pool = [
+        name
+        for name in (
+            "Lumphini Park",
+            CORRIDOR_EXIT,
+            "The Green Mile",
+            "Green Bridge Midpoint",
+            "Asok BTS",
+            "Ratchaprasong",
+            "Sala Daeng BTS",
+            "Lumphini MRT",
+            "QSNCC MRT",
+            "Queen Sirikit National Convention Center",
+        )
+        if name in landmarks and name not in (start_name, finish_name)
     ]
-    # Optional second lap for distance
-    loop = [
-        finish_name,
-        CORRIDOR_EXIT,
-        "Lumphini Park",
-        CORRIDOR_START,
-        "Lumphini Park",
-        CORRIDOR_EXIT,
-        finish_name,
-    ]
+    rng.shuffle(mid_pool)
+    # Take 3–5 midpoints depending on seed
+    n_mid = rng.randint(3, min(5, len(mid_pool))) if mid_pool else 0
+    mids = mid_pool[:n_mid]
+
+    chain = [start_name] + mids + [finish_name]
+    # Optional return leg for loops / distance
+    loop_pool = list(mids)
+    rng.shuffle(loop_pool)
+    loop = [finish_name] + loop_pool + [start_name, finish_name]
 
     def _snap(name: str) -> tuple | None:
         if name not in landmarks:
@@ -1457,7 +1796,6 @@ def _generate_park_connector_route(
         if node and (not waypoints or node != waypoints[-1]):
             waypoints.append(node)
     if len(waypoints) < 2:
-        # Fallback: strip south → strip north → finish
         sorted_strip = sorted(strip_nodes, key=lambda n: n[1])
         if len(sorted_strip) >= 2:
             waypoints = [sorted_strip[0], sorted_strip[-1]]
@@ -1466,6 +1804,8 @@ def _generate_park_connector_route(
                 waypoints.append(fin)
 
     target = _active_target_dist_mi()
+    # Slight target jitter so loops differ by seed
+    target *= rng.uniform(0.88, 1.12)
     route: list[tuple] = [waypoints[0]]
     total = 0.0
 
@@ -1485,9 +1825,8 @@ def _generate_park_connector_route(
         if not _append_leg(wp):
             continue
 
-    # Add loops until target (allow node reuse — dense city grid)
     safety = 0
-    while total < target * 0.92 and safety < 6:
+    while total < target * 0.92 and safety < 8:
         safety += 1
         order = list(loop)
         if rng.random() < 0.5:
@@ -1514,6 +1853,7 @@ def _generate_best_route(
     road_names: Dict[tuple, str],
     seed: int | None = None,
     finish_landmark: str | None = None,
+    start_landmark: str | None = None,
     max_candidates: int = 10,
 ) -> tuple[list[tuple], float]:
     """Try multiple seeds and return the best *clean* marathon-distance route.
@@ -1534,7 +1874,12 @@ def _generate_best_route(
     if _is_bangkok_network():
         rng = random.Random(seed)
         route, dist = _generate_park_connector_route(
-            adj, landmarks, strip_nodes, rng, finish_landmark=finish_landmark
+            adj,
+            landmarks,
+            strip_nodes,
+            rng,
+            finish_landmark=finish_landmark,
+            start_landmark=start_landmark,
         )
         if route:
             logger.info(
@@ -1880,82 +2225,56 @@ async def plan_marathon_route(
     waypoints: Optional[List[List[float]]] = None,
     petal_names: Optional[List[str]] = None,
     algorithm: str = "zone_sweep",
+    route_shape: Optional[str] = None,
     finish_landmark: Optional[str] = None,
+    start_landmark: Optional[str] = None,
     seed: Optional[int] = None,
-    force_replan: bool = False,
+    target_distance_km: Optional[float] = None,
+    force_replan: bool = True,
     runner_count: int = 10000,
     tool_context: Optional[ToolContext] = None,
 ) -> dict:
-    """Generate a mathematically perfect 26.2188 mile marathon route.
+    """Generate a running / marathon route on the built-in road network.
 
-    If geojson_data is not provided, uses the built-in Las Vegas road network.
+    If geojson_data is not provided, uses the built-in Bangkok network
+    (Lumphini–Benjakitti) or falls back to the bundled GeoJSON.
 
-    IMPORTANT: This tool is idempotent. If a route has already been planned in this
-    session, it returns status "already_planned" with the cached route instead of
-    regenerating. Call this tool only once per planning pass. To force regeneration
-    (e.g., after evaluator feedback requires changes), set force_replan=True.
+    By default regenerates a new route each call (new random seed unless ``seed``
+    is set). Set ``force_replan=False`` only when you intentionally want the
+    cached session route (e.g. evaluator re-reads).
 
-    Routes can be generated using two algorithms:
+    Bangkok shapes:
+      - Default / park-connector: Lumphini ↔ Benjakitti (~10 km).
+      - Heart inside Lumphini only: ``route_shape="heart"`` or
+        ``algorithm="park_heart"`` (multi-lap heart on park paths; use
+        ``target_distance_km=10`` for a 10K).
 
-    ZONE-SWEEP (default, algorithm="zone_sweep"):
-      Generates varied, non-crossing routes using zone-sweep decomposition.
-      Routes start northbound on the Strip at the Las Vegas Sign, sweep
-      through Las Vegas neighborhoods, and finish near a landmark.
-      Use `seed` for reproducibility and `finish_landmark` to choose the
-      finishing point.
-
-    CLOVERLEAF (legacy, triggered by petal_names/waypoints/theme_sequence):
-      Uses pre-defined rectangular petal templates. See petal catalog below.
-
-    Routes are built as cloverleaf/petal patterns -- clean rectangular loops
-    radiating from Las Vegas Blvd. Pick 2-4 petals from the catalog to create
-    a route totaling ~26.2 miles. Available petals:
-
-    WEST PETALS (radiate west from the Strip):
-      - "west-flamingo-jones": Flamingo Rd to Jones Blvd, back via Desert Inn (~9.9 mi)
-      - "west-flamingo-rainbow": Flamingo Rd to Rainbow Blvd, back via Desert Inn (~12.4 mi)
-      - "west-tropicana-decatur": Tropicana Ave to Decatur Blvd, back via Flamingo (~6.2 mi)
-      - "west-harmon-arville": Harmon Ave to Arville St, back via Flamingo (~5.0 mi)
-
-    NORTH PETALS (radiate north/northwest):
-      - "north-sahara-rainbow": Sahara Ave to Rainbow Blvd, back via Spring Mtn (~8.7 mi)
-      - "north-sahara-jones": Sahara Ave to Jones Blvd, back via Desert Inn (~6.2 mi)
-      - "north-sahara-decatur": Sahara Ave to Decatur Blvd, back via Edna (~5.0 mi)
-
-    SOUTH PETALS (radiate south):
-      - "south-tropicana-vv-sunset": Tropicana to Valley View to Sunset (~5.0 mi)
-      - "south-tropicana-decatur-sunset": Tropicana to Decatur to Sunset (~7.5 mi)
-      - "south-tropicana-rainbow-sunset": Tropicana to Rainbow to Sunset (~11.2 mi)
-
-    EAST PETALS (radiate east):
-      - "east-desertinn-maryland": Desert Inn Rd to Maryland Pkwy, back via Tropicana (~6.2 mi)
-      - "east-sunset-pecos": Sunset Rd to Pecos Rd, back via Russell (~8.7 mi)
-
-    Example combinations that total ~26.2 miles:
-      - ["west-flamingo-jones", "north-sahara-rainbow", "south-tropicana-vv-sunset"] (~23.6 mi + Strip connectors)
-      - ["south-tropicana-rainbow-sunset", "north-sahara-rainbow"] (~19.9 mi + Strip connectors)
-      - ["west-flamingo-rainbow", "east-desertinn-maryland", "south-tropicana-vv-sunset"] (~23.6 mi + connectors)
+    ZONE-SWEEP / CLOVERLEAF params below are mostly Las Vegas–oriented legacy.
 
     Args:
-        algorithm: Route generation algorithm. "zone_sweep" (default) or
-            "cloverleaf" (legacy, used when petal_names/waypoints/theme_sequence provided).
-        finish_landmark: Finishing landmark name (zone_sweep only). Random from pool if omitted.
-        seed: Random seed for reproducible routes (zone_sweep only). Random if omitted.
+        algorithm: ``"zone_sweep"`` (default Bangkok park-connector),
+            ``"park_heart"`` (Lumphini heart only), or legacy cloverleaf triggers.
+        route_shape: ``"heart"`` / ``"lumphini_heart"`` → stay inside Lumphini
+            and trace a heart-shaped multi-lap path. Same as algorithm=park_heart.
+        finish_landmark: Finishing landmark (park-connector). Ignored for heart.
+        start_landmark: Start landmark. Heart default: Lumphini Park South Gate.
+        seed: Random seed for variety / reproducibility. Random if omitted.
+        target_distance_km: Desired length in km (e.g. 10). Defaults to ~10 km
+            on the Bangkok network.
         geojson_data: Optional GeoJSON string of the road network to use.
-        theme_sequence: Optional list of landmark names (legacy, prefer petal_names).
-        waypoints: Optional list of [lon, lat] coordinate pairs (advanced usage).
-        petal_names: List of petal template names from the catalog above.
-            Pick 2-4 petals totaling approximately 26.2 miles.
-        force_replan: If True, discard the cached route and regenerate.
+        theme_sequence: Optional list of landmark names (legacy).
+        waypoints: Optional list of [lon, lat] coordinate pairs (advanced).
+        petal_names: Legacy Las Vegas petal catalog names.
+        force_replan: If False, return the cached session route. Default True.
         tool_context: ADK tool context.
     """
-    # Idempotency guard: return cached route if already planned (unless force_replan)
+    # Optional cache: only when caller explicitly sets force_replan=False
     if not force_replan and tool_context and tool_context.state.get("marathon_route"):
-        logger.info("PLANNER: Route already planned, returning cached result.")
+        logger.info("PLANNER: Reusing cached route (force_replan=False).")
         cached = tool_context.state["marathon_route"]
         return {
             "status": "already_planned",
-            "message": "Marathon route was already planned in this session. Use report_marathon_route to emit the map.",
+            "message": "Returning cached route. Set force_replan=True for a new map.",
             "summary": _route_summary_for_llm(cached),
         }
 
@@ -1988,21 +2307,56 @@ async def plan_marathon_route(
         nodes = set(adj.keys())
 
         # Route generation - select algorithm
-        if (
+        used_seed = seed if seed is not None else random.randrange(2**32)
+        rng = random.Random(used_seed)
+        target_mi = (
+            float(target_distance_km) / 1.60934
+            if target_distance_km is not None
+            else _active_target_dist_mi()
+        )
+        shape = (route_shape or "").strip().lower()
+        want_heart = (
+            algorithm in ("park_heart", "lumphini_heart", "heart")
+            or shape in ("heart", "lumphini_heart", "park_heart", "หัวใจ")
+        )
+
+        heart_laps = 0
+        heart_lap_mi = 0.0
+        if want_heart:
+            route_coords, final_dist, _lap, heart_lap_mi, heart_laps = (
+                _generate_lumphini_heart_route(
+                    adj,
+                    landmarks,
+                    road_names,
+                    rng,
+                    target_mi=target_mi,
+                    start_landmark=start_landmark,
+                )
+            )
+            if not route_coords:
+                return {
+                    "status": "error",
+                    "message": (
+                        "Could not build a Lumphini heart route on park paths. "
+                        "Try again or use the default park-connector."
+                    ),
+                }
+        elif (
             algorithm == "zone_sweep"
             and not petal_names
             and not waypoints
             and not theme_sequence
         ):
-            # New zone-sweep algorithm with tournament strategy
+            # Bangkok park-connector / zone-sweep with seed variety
             route_coords, final_dist = _generate_best_route(
                 adj,
                 nodes,
                 landmarks,
                 strip_nodes,
                 road_names,
-                seed=seed if seed is not None else random.randrange(2**32),
+                seed=used_seed,
                 finish_landmark=finish_landmark,
+                start_landmark=start_landmark,
                 max_candidates=10,
             )
         else:
@@ -2023,6 +2377,12 @@ async def plan_marathon_route(
                 strip_nodes=strip_nodes,
                 waypoints=wp_tuples,
             )
+
+        if not route_coords:
+            return {
+                "status": "error",
+                "message": "Route generation produced an empty path.",
+            }
 
         # Split route into named road segments
         route_segments = _split_route_by_road(route_coords, road_names, final_dist)
@@ -2049,28 +2409,55 @@ async def plan_marathon_route(
             "type": "FeatureCollection",
             "features": [start_marker, finish_marker] + route_segments,
         }
+        if want_heart:
+            output["properties"] = {
+                "route_shape": "heart",
+                "area": "Lumphini Park only",
+                "distance_mi": round(final_dist, 4),
+                "distance_km": round(final_dist * 1.60934, 2),
+                "lap_km": round(heart_lap_mi * 1.60934, 2),
+                "laps": heart_laps,
+                "note": (
+                    f"Map shows 1 heart lap (~{heart_lap_mi * 1.60934:.1f} km). "
+                    f"Run {heart_laps} laps for ~{final_dist * 1.60934:.1f} km total."
+                ),
+            }
+            if route_segments:
+                route_segments[0]["properties"].update(
+                    {
+                        "distance_mi": round(final_dist, 4),
+                        "laps": heart_laps,
+                        "route_shape": "heart",
+                    }
+                )
 
-        # Single-pass infrastructure placement (replaces old sequential calls)
-        infra_result = await add_course_infrastructure(
-            output, runner_count=runner_count, tool_context=tool_context
-        )
-        if infra_result["status"] == "success":
-            output = infra_result["geojson"]
+        # Aid/medical stations clutter casual park maps — skip for heart runs
+        if not want_heart:
+            infra_result = await add_course_infrastructure(
+                output, runner_count=runner_count, tool_context=tool_context
+            )
+            if infra_result["status"] == "success":
+                output = infra_result["geojson"]
 
         # Cache in session state for later/other agent recall
         if tool_context:
             tool_context.state["marathon_route"] = output
+            tool_context.state["marathon_route_seed"] = used_seed
+            tool_context.state["marathon_route_shape"] = "heart" if want_heart else "default"
 
         summary = _route_summary_for_llm(output)
+        shape_note = " (Lumphini heart)" if want_heart else ""
         return {
             "status": "success",
             "message": (
-                "Marathon route planned successfully including logistical stations. "
-                f"Length ≈ {summary['distance_km']} km. "
+                f"Route planned successfully{shape_note}. "
+                f"Length ≈ {summary['distance_km']} km (seed={used_seed}). "
                 "Call report_marathon_route to render the interactive map. "
                 "Do not dump raw GeoJSON into the reply."
             ),
             "summary": summary,
+            "seed": used_seed,
+            "route_shape": "heart" if want_heart else None,
         }
     except Exception as e:
         logger.error(f"PLANNER: Error processing GeoJSON: {e}")
@@ -2529,12 +2916,24 @@ def _route_geojson_to_leaflet_html(route_geojson: dict) -> str:
     const legend = L.control({{ position: 'bottomleft' }});
     legend.onAdd = function() {{
       const div = L.DomUtil.create('div', 'legend');
-      div.innerHTML =
-        '<div><span class="line"></span>Route</div>' +
+      const rp = route.properties || {{}};
+      let html = '';
+      if (rp.route_shape === 'heart') {{
+        html += '<div><b>♥ Lumphini Heart</b></div>';
+        if (rp.note) html += '<div style="max-width:220px">' + rp.note + '</div>';
+        html += '<div><span class="line"></span>1 lap on map</div>';
+      }} else {{
+        html += '<div><span class="line"></span>Route</div>';
+      }}
+      html +=
         '<div><i style="background:#16a34a"></i>Start</div>' +
-        '<div><i style="background:#dc2626"></i>Finish</div>' +
-        '<div><i style="background:#2563eb"></i>Water</div>' +
-        '<div><i style="background:#7c3aed"></i>Medical</div>';
+        '<div><i style="background:#dc2626"></i>Finish</div>';
+      if (rp.route_shape !== 'heart') {{
+        html +=
+          '<div><i style="background:#2563eb"></i>Water</div>' +
+          '<div><i style="background:#7c3aed"></i>Medical</div>';
+      }}
+      div.innerHTML = html;
       return div;
     }};
     legend.addTo(map);
@@ -2558,6 +2957,10 @@ def _route_summary_for_llm(route_geojson: dict) -> dict:
     if len(coords) >= 2:
         index = _build_distance_index(coords)
         dist_mi = index[-1][1] if index else 0.0
+    # Prefer explicit multi-lap distance (heart map shows 1 lap only)
+    props = route_geojson.get("properties") or {}
+    if props.get("distance_mi") is not None:
+        dist_mi = float(props["distance_mi"])
     dist_km = round(dist_mi * 1.60934, 2)
     start = coords[0] if coords else None
     finish = coords[-1] if coords else None
@@ -2570,7 +2973,7 @@ def _route_summary_for_llm(route_geojson: dict) -> dict:
             road_names.append(name)
         if len(road_names) >= 12:
             break
-    return {
+    summary = {
         "distance_km": dist_km,
         "distance_mi": round(dist_mi, 3),
         "feature_count": len(features),
@@ -2581,6 +2984,13 @@ def _route_summary_for_llm(route_geojson: dict) -> dict:
         "sample_roads": road_names,
         "note": "Full GeoJSON is in session state / map artifact only — not returned here.",
     }
+    if props.get("route_shape"):
+        summary["route_shape"] = props["route_shape"]
+    if props.get("laps"):
+        summary["laps"] = props["laps"]
+        summary["lap_km"] = props.get("lap_km")
+        summary["note"] = props.get("note") or summary["note"]
+    return summary
 
 
 async def report_marathon_route(
@@ -2603,7 +3013,10 @@ async def report_marathon_route(
             "message": "No marathon route found. Run 'plan_marathon_route' first.",
         }
 
-    map_filename = "marathon_route_map.html"
+    # Unique filename so ADK Web shows a distinct artifact each replan
+    route_seed = tool_context.state.get("marathon_route_seed")
+    suffix = str(route_seed) if route_seed is not None else str(random.randrange(2**32))
+    map_filename = f"marathon_route_map_{suffix}.html"
     try:
         html = _route_geojson_to_leaflet_html(route_geojson)
         artifact = types.Part(

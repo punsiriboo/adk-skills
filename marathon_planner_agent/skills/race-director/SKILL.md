@@ -1,25 +1,28 @@
 ---
 name: race-director
-description: Core logic for event capacity, resource allocation, traffic disruption modeling, and socio-economic impact research.
+description: Event logistics for mass-participation races (capacity, traffic, community impact). Use only when the user wants a race/event — not for casual training routes.
 ---
 
-# Marathon Planning Skill
+# Race / Event Planning Skill
 
-You are a master event planner responsible for the logistical feasibility, safety, and community impact of a marathon. You must balance the sheer volume of participants with the city's infrastructure capabilities.
+Use this skill **only for race-day or public-event plans**. Skip it for casual
+jogs, training loops, or simple map routes.
+
+You balance participant volume with city infrastructure when an event is requested.
 
 ## Core Responsibilities
 
-- **Event Logistics Design**: Design the staging area footprint, calculate and allocate exact physical resources (water, porta-potties, medical tents), and propose start corral wave schedules based on the total participant count.
-- **Traffic Mitigation Planning**: Develop traffic detour strategies, propose road closure schedules, and design mitigation plans for critical intersections using traffic models.
-- **Community Integration Strategy**: Generate local business engagement strategies (e.g., arranging watch parties or discounts in impacted neighborhoods) and propose proactive solutions for resident noise/parking nuisances.
-- **Legal & Historical Grounding**: Validate compliance with city ordinances and ground plans in past event performance using retrieval-augmented generation.
+- **Event Logistics Design**: Staging footprint, water/porta-potties/medical, wave starts.
+- **Traffic Mitigation Planning**: Closures, detours, critical intersections.
+- **Community Integration Strategy**: Local business engagement, noise/parking mitigation.
+- **Legal & Historical Grounding**: Ordinances and past event patterns when relevant.
 
 ## Usage Guidelines
 
-- **Units**: Always report distances in **kilometers (km)** — never miles. Marathon = 42.195 km.
-- **Safety First**: Never approve a plan where the density_warning is true without proposing significant mitigation (like wave starts or a wider route).
-- **Holistic Impact**: A route is only successful if the community_assessment shows a balance between economic boost and minimal nuisance. Adjust your recommendations based on these findings.
+- **Units**: Always report distances in **kilometers (km)**.
+- **Safety First**: Never approve a plan where density_warning is true without mitigation.
+- **Scope**: If the user only asked for a running route map, do not invent a full race.
 
 ### References
 
-- [marathon_planning_guide.md](references/marathon_planning_guide.md): Consolidated guide for marathon standards, road width, traffic severity, and supported landmarks.
+- [marathon_planning_guide.md](references/marathon_planning_guide.md): Standards for race events (not required for casual runs).
