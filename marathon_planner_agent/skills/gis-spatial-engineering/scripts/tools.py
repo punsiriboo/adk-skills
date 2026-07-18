@@ -77,10 +77,13 @@ _LUMPHINI_ARTERIAL_HINTS = (
     "sarasin",
 )
 
-# Heart fitted to Lumphini (tip ≈ Rama VI / South Gate). Used as curve center/scale.
-_LUMPHINI_HEART_CENTER = (100.54275, 13.73105)
-_LUMPHINI_HEART_SCALE_LON = 0.00270  # half-width in degrees
-_LUMPHINI_HEART_SCALE_LAT = 0.00195  # half-height in degrees
+# Heart silhouette target bbox inside Lumphini (tip south near Rama VI)
+_LUMPHINI_HEART_BBOX = (100.54000, 13.72920, 100.54550, 13.73310)
+# Open water / lawn voids the route must NOT cross (push guide onto shore paths)
+_LUMPHINI_WATER_BBOXES = (
+    (100.54085, 13.73035, 100.54365, 13.73235),  # สระกว้าง
+    (100.54370, 13.72995, 100.54505, 13.73115),  # eastern ponds
+)
 
 
 PETAL_CATALOG: Dict[str, dict] = {
@@ -1480,16 +1483,13 @@ def _filter_lumphini_park_graph(
 
 
 def _parametric_heart_lonlat(
-    n: int = 120,
-    center: tuple[float, float] = _LUMPHINI_HEART_CENTER,
-    scale_lon: float = _LUMPHINI_HEART_SCALE_LON,
-    scale_lat: float = _LUMPHINI_HEART_SCALE_LAT,
+    n: int = 220,
+    bbox: tuple[float, float, float, float] = _LUMPHINI_HEART_BBOX,
 ) -> list[tuple[float, float]]:
-    """Classic parametric heart mapped into Lumphini lon/lat (tip at south)."""
-    pts: list[tuple[float, float]] = []
+    """Classic parametric heart fitted into a lon/lat bbox (tip at south)."""
+    raw: list[tuple[float, float]] = []
     for i in range(n):
         t = 2.0 * math.pi * i / n
-        # Standard heart curve; tip at bottom (min y)
         x = 16.0 * (math.sin(t) ** 3)
         y = (
             13.0 * math.cos(t)
@@ -1497,140 +1497,115 @@ def _parametric_heart_lonlat(
             - 2.0 * math.cos(3.0 * t)
             - math.cos(4.0 * t)
         )
-        lon = center[0] + (x / 16.0) * scale_lon
-        lat = center[1] + (y / 17.0) * scale_lat
+        raw.append((x, y))
+    xs = [p[0] for p in raw]
+    ys = [p[1] for p in raw]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    lon_min, lat_min, lon_max, lat_max = bbox
+    pts: list[tuple[float, float]] = []
+    for x, y in raw:
+        lon = lon_min + (x - min_x) / (max_x - min_x) * (lon_max - lon_min)
+        lat = lat_min + (y - min_y) / (max_y - min_y) * (lat_max - lat_min)
         pts.append((lon, lat))
     pts.append(pts[0])
     return pts
 
 
-def _point_to_segment_dist_mi(
-    p: tuple[float, float],
-    a: tuple[float, float],
-    b: tuple[float, float],
-) -> float:
-    """Approximate distance from point to segment using local degrees→miles."""
-    # Local equirectangular in miles near Bangkok
-    lat0 = math.radians((a[1] + b[1] + p[1]) / 3.0)
-    ax, ay = a[0] * math.cos(lat0), a[1]
-    bx, by = b[0] * math.cos(lat0), b[1]
-    px, py = p[0] * math.cos(lat0), p[1]
-    abx, aby = bx - ax, by - ay
-    apx, apy = px - ax, py - ay
-    ab2 = abx * abx + aby * aby
-    t = 0.0 if ab2 < 1e-18 else max(0.0, min(1.0, (apx * abx + apy * aby) / ab2))
-    cx, cy = ax + t * abx, ay + t * aby
-    # degrees → miles (~69 mi per deg lat)
-    return math.hypot(px - cx, py - cy) * 69.0
+def _nudge_off_water(lon: float, lat: float) -> tuple[float, float]:
+    """Push coordinates off lake/pond interiors onto nearby shore corridors."""
+    margin = 0.00022
+    for wlon0, wlat0, wlon1, wlat1 in _LUMPHINI_WATER_BBOXES:
+        if wlon0 <= lon <= wlon1 and wlat0 <= lat <= wlat1:
+            d_w, d_e = lon - wlon0, wlon1 - lon
+            d_s, d_n = lat - wlat0, wlat1 - lat
+            m = min(d_w, d_e, d_s, d_n)
+            if m == d_w:
+                lon = wlon0 - margin
+            elif m == d_e:
+                lon = wlon1 + margin
+            elif m == d_s:
+                lat = wlat0 - margin
+            else:
+                lat = wlat1 + margin
+    return (lon, lat)
 
 
-def _dijkstra_along_guide(
-    start: tuple,
-    end: tuple,
-    adj: Dict[tuple, List[tuple]],
-    guide_a: tuple[float, float],
-    guide_b: tuple[float, float],
-    pull: float = 12.0,
-) -> tuple[List[tuple], float]:
-    """Shortest path that stays near the guide segment (preserves heart outline)."""
-    import heapq
+def _polyline_length_mi(coords: list[tuple]) -> float:
+    if len(coords) < 2:
+        return 0.0
+    return sum(_haversine(coords[i], coords[i + 1]) for i in range(len(coords) - 1))
 
-    queue: list[tuple[float, float, tuple]] = [(0.0, 0.0, start)]  # (cost, true_dist, node)
-    best_cost: dict[tuple, float] = {start: 0.0}
-    true_dist: dict[tuple, float] = {start: 0.0}
-    prev: dict[tuple, tuple] = {}
 
-    while queue:
-        cost, dist, curr = heapq.heappop(queue)
-        if curr == end:
-            break
-        if cost > best_cost.get(curr, float("inf")):
+def _strip_route_backtracks(route: list[tuple]) -> list[tuple]:
+    """Remove A→B→A spurs that make on-road hearts look messy."""
+    out: list[tuple] = []
+    for p in route:
+        while len(out) >= 2 and p == out[-2]:
+            out.pop()
+        if out and p == out[-1]:
             continue
-        for neighbor, d in adj.get(curr, []):
-            # Penalize edges that leave the heart outline
-            off = _point_to_segment_dist_mi(neighbor, guide_a, guide_b)
-            step_cost = d * (1.0 + pull * off)
-            new_cost = cost + step_cost
-            if new_cost < best_cost.get(neighbor, float("inf")):
-                best_cost[neighbor] = new_cost
-                true_dist[neighbor] = dist + d
-                prev[neighbor] = curr
-                heapq.heappush(queue, (new_cost, dist + d, neighbor))
-
-    if end not in true_dist:
-        return [], 0.0
-    path = [end]
-    cur = end
-    hops = 0
-    while cur != start and hops < 5000:
-        cur = prev[cur]
-        path.append(cur)
-        hops += 1
-    path.reverse()
-    return path, true_dist[end]
+        out.append(p)
+    return out
 
 
-def _follow_guide_on_graph(
+def _map_match_guide_to_park_paths(
     guide: list[tuple[float, float]],
-    adj: Dict[tuple, List[tuple]],
-    nodes: Set[tuple],
-    arrive_mi: float = 0.035,
-    max_steps: int = 4000,
+    park_adj: Dict[tuple, List[tuple]],
+    park_nodes: Set[tuple],
 ) -> tuple[list[tuple], float]:
-    """Walk park edges while chasing a guide curve with strict forward progress.
+    """Snap a guide curve onto park footpaths and connect with Dijkstra only.
 
-    Only steps to a neighbor that gets closer to the current guide target.
-    If stuck, short-path snap to the target node and advance the guide index.
+    Every coordinate in the result is a graph node; every step is a real edge.
     """
-    if not guide:
+    snapped: list[tuple] = []
+    for gp in guide:
+        lon, lat = _nudge_off_water(gp[0], gp[1])
+        node = _find_closest_node((lon, lat), park_nodes)
+        if node is None:
+            continue
+        if snapped and node == snapped[-1]:
+            continue
+        snapped.append(node)
+    if len(snapped) < 8:
         return [], 0.0
-    current = _find_closest_node(guide[0], nodes)
-    if current is None:
-        return [], 0.0
+    if snapped[0] != snapped[-1]:
+        snapped.append(snapped[0])
 
-    route: list[tuple] = [current]
-    total = 0.0
-    gi = 1
-    steps = 0
-
-    while gi < len(guide) and steps < max_steps:
-        steps += 1
-        target = guide[gi]
-        cur_d = _haversine(current, target)
-        if cur_d <= arrive_mi:
-            gi += 1
+    route: list[tuple] = [snapped[0]]
+    for a, b in zip(snapped, snapped[1:]):
+        if a == b:
             continue
-
-        nbrs = adj.get(current, [])
-        progress: list[tuple[float, float, tuple]] = []
-        for n, edge_d in nbrs:
-            nd = _haversine(n, target)
-            if nd < cur_d - 1e-7:
-                progress.append((nd, edge_d, n))
-
-        if progress:
-            progress.sort(key=lambda x: (x[0], x[1]))
-            _, edge_d, best_n = progress[0]
-            total += edge_d
-            route.append(best_n)
-            current = best_n
+        path, dist = _get_path_dijkstra_park(a, b, park_adj)
+        if not path or len(path) < 2:
             continue
+        # Long jumps: try a mid shore point to stay on the heart outline
+        if dist > 0.16:
+            mid = _nudge_off_water((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
+            m = _find_closest_node(mid, park_nodes)
+            if m and m not in (a, b):
+                p1, d1 = _get_path_dijkstra_park(a, m, park_adj)
+                p2, d2 = _get_path_dijkstra_park(m, b, park_adj)
+                if (
+                    p1
+                    and p2
+                    and len(p1) >= 2
+                    and len(p2) >= 2
+                    and (d1 + d2) <= dist * 1.25
+                ):
+                    route.extend(p1[1:])
+                    route.extend(p2[1:])
+                    continue
+        route.extend(path[1:])
 
-        # Stuck: jump toward this guide point, then advance
-        snap = _find_closest_node(target, nodes)
-        if snap is None or snap == current:
-            gi += 1
-            continue
-        path, dist = _get_path_dijkstra_park(current, snap, adj)
-        if path and len(path) >= 2 and dist <= 0.18:
-            for p in path[1:]:
-                total += _haversine(route[-1], p)
-                route.append(p)
-            current = route[-1]
-        # Always advance guide after a snap attempt to avoid infinite orbits
-        gi += 1
+    route = _strip_route_backtracks(route)
+    if len(route) >= 2 and route[0] != route[-1]:
+        path, _ = _get_path_dijkstra_park(route[-1], route[0], park_adj)
+        if path and len(path) >= 2:
+            route.extend(path[1:])
+            route = _strip_route_backtracks(route)
 
-    return route, total
+    return route, _polyline_length_mi(route)
 
 
 def _generate_lumphini_heart_route(
@@ -1641,66 +1616,63 @@ def _generate_lumphini_heart_route(
     target_mi: float | None = None,
     start_landmark: str | None = None,
 ) -> tuple[list[tuple], float, list[tuple], float, int]:
-    """Heart-shaped route on Lumphini park paths only.
+    """Heart-shaped route on Lumphini **park paths only** (no cutting lakes).
 
-    Returns ``(map_coords, reported_dist_mi, lap_coords, lap_mi, laps)``.
-    ``map_coords`` is a **single** clean heart lap (so the artifact looks like a
-    heart). ``reported_dist_mi`` stacks identical laps to reach the target.
+    Guide = parametric ♥ nudged off water, then map-matched onto the footpath
+    graph. Map shows 1 lap; distance stacks identical laps toward the target.
     """
     park_adj = _filter_lumphini_park_graph(adj, road_names)
     if len(park_adj) < 20:
         logger.warning("PLANNER: Lumphini park subgraph too small (%d nodes)", len(park_adj))
         return [], 0.0, [], 0.0, 0
-
     park_nodes = set(park_adj.keys())
     target = target_mi if target_mi is not None else _active_target_dist_mi()
 
-    scale_lon = _LUMPHINI_HEART_SCALE_LON * rng.uniform(0.99, 1.04)
-    scale_lat = _LUMPHINI_HEART_SCALE_LAT * rng.uniform(0.99, 1.04)
-    center = (
-        _LUMPHINI_HEART_CENTER[0] + rng.uniform(-0.00003, 0.00003),
-        _LUMPHINI_HEART_CENTER[1] + rng.uniform(-0.00002, 0.00002),
+    lon_min, lat_min, lon_max, lat_max = _LUMPHINI_HEART_BBOX
+    j = 0.00003
+    bbox = (
+        lon_min + rng.uniform(-j, j),
+        lat_min + rng.uniform(-j, j),
+        lon_max + rng.uniform(-j, j),
+        lat_max + rng.uniform(-j, j),
     )
-    guide = _parametric_heart_lonlat(
-        n=180, center=center, scale_lon=scale_lon, scale_lat=scale_lat
-    )
+    guide = _parametric_heart_lonlat(n=160, bbox=bbox)
 
-    # Start at tip (south) near South Gate when possible
-    start_name = start_landmark or CORRIDOR_START
-    tip_hint = landmarks.get(start_name) or min(guide, key=lambda p: p[1])
-    tip_i = min(range(len(guide)), key=lambda i: _haversine(guide[i], tip_hint))
+    # Start at southern tip (geometric), not the off-park South Gate landmark
+    tip_i = min(range(len(guide) - 1), key=lambda i: guide[i][1])
+    tip_hint = landmarks.get(start_landmark or "") if start_landmark else None
+    if tip_hint and tip_hint[1] >= lat_min - 0.0003:
+        tip_i = min(range(len(guide) - 1), key=lambda i: _haversine(guide[i], tip_hint))
     guide = guide[tip_i:-1] + guide[:tip_i] + [guide[tip_i]]
 
-    lap, lap_dist = _follow_guide_on_graph(guide, park_adj, park_nodes)
-    if len(lap) < 40 or lap_dist < 1.0:
+    lap, lap_dist = _map_match_guide_to_park_paths(guide, park_adj, park_nodes)
+    if len(lap) < 40 or lap_dist < 0.9:
         logger.warning(
-            "PLANNER: Heart follow failed (pts=%d dist=%.3f mi)", len(lap), lap_dist
+            "PLANNER: On-road heart failed (pts=%d dist=%.3f mi)", len(lap), lap_dist
         )
         return [], 0.0, [], 0.0, 0
 
-    # Close the loop back to start
-    if lap[0] != lap[-1]:
-        path, dist = _get_path_dijkstra_park(lap[-1], lap[0], park_adj)
-        if path and len(path) >= 2 and dist < 0.35:
-            for p in path[1:]:
-                lap_dist += _haversine(lap[-1], p)
-                lap.append(p)
-        else:
-            lap_dist += _haversine(lap[-1], lap[0])
-            lap.append(lap[0])
+    # Sanity: every hop must be a park edge
+    off = 0
+    for i in range(len(lap) - 1):
+        nbrs = {n for n, _ in park_adj.get(lap[i], [])}
+        if lap[i + 1] not in nbrs:
+            off += 1
+    if off:
+        logger.warning("PLANNER: On-road heart has %d off-graph hops — rejecting", off)
+        return [], 0.0, [], 0.0, 0
 
     laps = max(1, int(math.ceil(target / max(lap_dist, 1e-6))))
     laps = min(laps, 12)
     reported = lap_dist * laps
 
     logger.info(
-        "PLANNER: Lumphini HEART map-lap %.2f km × %d = %.1f km (%d pts)",
+        "PLANNER: Lumphini HEART on-road lap=%.2f km × %d = %.1f km (%d pts)",
         lap_dist * 1.60934,
         laps,
         reported * 1.60934,
         len(lap),
     )
-    # Map shows one clean lap; distance is multi-lap
     return lap, reported, lap, lap_dist, laps
 
 
@@ -2412,14 +2384,15 @@ async def plan_marathon_route(
         if want_heart:
             output["properties"] = {
                 "route_shape": "heart",
-                "area": "Lumphini Park only",
+                "area": "Lumphini Park paths only",
                 "distance_mi": round(final_dist, 4),
                 "distance_km": round(final_dist * 1.60934, 2),
                 "lap_km": round(heart_lap_mi * 1.60934, 2),
                 "laps": heart_laps,
                 "note": (
-                    f"Map shows 1 heart lap (~{heart_lap_mi * 1.60934:.1f} km). "
-                    f"Run {heart_laps} laps for ~{final_dist * 1.60934:.1f} km total."
+                    f"On park footpaths only (♥ outline). "
+                    f"Map = 1 lap (~{heart_lap_mi * 1.60934:.1f} km); "
+                    f"repeat ×{heart_laps} ≈ {final_dist * 1.60934:.1f} km."
                 ),
             }
             if route_segments:

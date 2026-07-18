@@ -43,9 +43,8 @@ Key features:
   (`Lumphini` → Witthayu / Sarasin → Green Mile → `Benjakitti`), with optional
   loops for distance. Vary with `seed` and `start_landmark`.
 - **Heart inside Lumphini only:** `route_shape="heart"` (or `algorithm="park_heart"`).
-  Stays on park footpaths (no Rama IV / Witthayu arterials), traces a heart
-  loop (~2.5–3 km per lap) and repeats until `target_distance_km` (e.g. 10).
-  Use this when the user asks for รูปหัวใจ / ภายในสวนลุมพินีเท่านั้น.
+  Map-matches a ♥ guide onto **park footpaths** (avoids cutting lakes). Map = 1 lap;
+  repeat laps for `target_distance_km` (e.g. 10). Use for รูปหัวใจ / ในสวนลุมเท่านั้น.
 
 Legacy **zone-sweep** / **cloverleaf** params still exist on the tool but are
 Las Vegas–oriented; prefer defaults or `route_shape="heart"` for Bangkok park runs.

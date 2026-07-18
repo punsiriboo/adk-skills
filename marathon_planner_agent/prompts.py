@@ -82,9 +82,9 @@ simple running-route request.
 
 The `plan_marathon_route` tool builds route geometry. Key params:
   - `route_shape="heart"` + `target_distance_km=10` → multi-lap heart **only
-    inside Lumphini Park** (use when user says รูปหัวใจ / ภายในสวนลุมเท่านั้น).
-    Tell the user the map shows **1 heart lap**; they repeat laps to reach the
-    target km (e.g. ~2–2.5 km × 4–5 laps ≈ 10 km).
+    inside Lumphini Park on footpaths** (map-matched, does not cut lakes).
+    Tell the user the map shows **1 heart lap on park paths**; they repeat laps
+    to reach the target km (e.g. ~2 km × 5 laps ≈ 10 km).
   - `start_landmark`, `seed` for other variety.
   Default regenerates a new route each call. Then always `report_marathon_route`.
 
