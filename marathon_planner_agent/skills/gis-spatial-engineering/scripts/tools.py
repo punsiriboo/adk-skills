@@ -41,8 +41,9 @@ _STRIP_HUB = (-115.172851, 36.086141)
 # Zone-sweep route generation constants
 # ---------------------------------------------------------------------------
 
-# Approximate center of the Las Vegas Strip for zone classification
-STRIP_CENTER = (-115.1730, 36.1120)
+# Approximate center of the corridor road for zone classification
+# Bangkok: Witthayu (Wireless) Road between Lumphini and Benjakitti
+STRIP_CENTER = (100.5465, 13.7300)
 
 # Empirical reserve for the serpentine-to-corridor-exit connector
 # distance.  Subtracted from the serpentine budget so the route
@@ -52,12 +53,15 @@ STRIP_CENTER = (-115.1730, 36.1120)
 # The 30-seed guarantee test validates this continuously.
 _CONNECTOR_RESERVE = 1.5
 
-# Start corridor landmarks (northbound on the Strip)
-CORRIDOR_START = "Las Vegas Sign"  # runner starts here
-CORRIDOR_EXIT = "Treasure Island"  # northbound extent on the Strip
+# Start corridor landmarks (northbound on Witthayu / Wireless Road)
+CORRIDOR_START = "Lumphini Park South Gate"  # runner starts here
+CORRIDOR_EXIT = "Sarasin Junction"  # northbound extent toward Benjakitti
+
+# Road name used as the primary corridor (was "Las Vegas Boulevard")
+CORRIDOR_ROAD = "Witthayu Road"
 
 # Default finish landmark
-FINISH_LANDMARK = "Michelob Ultra Arena"
+FINISH_LANDMARK = "Benjakitti Park"
 
 
 PETAL_CATALOG: Dict[str, dict] = {
@@ -474,7 +478,7 @@ def _build_graph(
                 edge_key = tuple(sorted((p1, p2)))
                 if name:
                     road_names[edge_key] = name
-                    if name == "Las Vegas Boulevard":
+                    if name == CORRIDOR_ROAD:
                         strip_nodes.add(p1)
                         strip_nodes.add(p2)
                 nodes.add(p1)
@@ -1812,7 +1816,7 @@ async def plan_marathon_route(
             if os.path.exists(data_path):
                 with open(data_path, "r") as f:
                     geojson_data = f.read()
-                logger.info("PLANNER: Using built-in Las Vegas road network.")
+                logger.info("PLANNER: Using built-in Bangkok road network (Lumphini–Benjakitti).")
             else:
                 logger.warning(
                     f"PLANNER: network.json not found at {data_path}. Using fallback."

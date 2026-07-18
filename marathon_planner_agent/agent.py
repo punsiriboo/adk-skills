@@ -21,12 +21,12 @@ description = "A helpful assistant for user questions."
 tools = []
 
 # # TODO: Replace Instruction and Description Prompt only
-# instruction=PLANNER_INSTRUCTION_NO_TOOLS
-# description="Expert GIS analyst for marathon route and event planning."
+instruction=PLANNER_INSTRUCTION_NO_TOOLS
+description="Expert GIS analyst for marathon route and event planning."
 
 # # TODO: Replaces Tools
-# instruction=PLANNER_INSTRUCTION
-# tools=get_tools()
+instruction=PLANNER_INSTRUCTION
+tools=get_tools()
 
 root_agent = Agent(
     model="gemini-3.1-pro-preview",
