@@ -1,6 +1,12 @@
 # ADK Skills
 
+![ADK Skills title](./img/title.png)
+
 ตัวอย่าง Google Agent Development Kit (ADK) ที่ใช้ Skills — มี 2 agents ใน repo นี้
+
+## Slides
+
+- [GoogleNextBKK — Build ADK Agent with Skill](https://docs.google.com/presentation/d/e/2PACX-1vST1j01s6fEWhbd5KD6RrGNRP6QAe7F865ksygJuXjjkUGJtxOO2wEGG1i5_5fczsrd54MVf7vnnXpL/pub)
 
 ## Agents
 

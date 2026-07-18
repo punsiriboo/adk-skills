@@ -114,8 +114,11 @@ Every marathon plan MUST explicitly address these six pillars in the output:
 
 # Route Reporting
 The `report_marathon_route` tool emits the final GeoJSON (with hydration stations
-and medical tents) to the gateway for visualization. It automatically retrieves
-the route from session state — no arguments needed. (Called in the Workflow.)"""
+and medical tents) and saves an interactive Leaflet HTML map artifact
+(`marathon_route_map.html`) that ADK Web can render. It automatically retrieves
+the route from session state — no arguments needed. Always call it after
+planning so the user can see the map. Report distances in kilometers (km).
+(Called in the Workflow.)"""
 
 TOOLS_PROMPT_ONLY = """\
 # User Prerequisites

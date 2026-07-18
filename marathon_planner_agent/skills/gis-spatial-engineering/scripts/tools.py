@@ -20,11 +20,15 @@ import logging
 import random
 from typing import Dict, Optional, List, Set
 from google.adk.tools.tool_context import ToolContext
+from google.genai import types
 
 logger = logging.getLogger(__name__)
 
 TARGET_DIST_MI = 26.2188
 HALF_MILE = 0.5  # 0.5 miles
+# Bangkok Lumphini–Benjakitti frame is too small for a non-crossing 42.195 km
+# course; use a 10 km target for that network instead.
+BANGKOK_TARGET_DIST_MI = 6.21371  # 10.0 km
 
 # ---------------------------------------------------------------------------
 # Petal template catalog
@@ -55,7 +59,7 @@ _CONNECTOR_RESERVE = 1.5
 
 # Start corridor landmarks (northbound on Witthayu / Wireless Road)
 CORRIDOR_START = "Lumphini Park South Gate"  # runner starts here
-CORRIDOR_EXIT = "Sarasin Junction"  # northbound extent toward Benjakitti
+CORRIDOR_EXIT = "Sarasin Junction"  # northbound along Witthayu / Sarasin
 
 # Road name used as the primary corridor (was "Las Vegas Boulevard")
 CORRIDOR_ROAD = "Witthayu Road"
@@ -615,12 +619,30 @@ def _find_off_strip_poi_node(
         return None
 
     # --- Find off-strip graph nodes near the POI ---
+    # Restrict to the connected component of the Strip corridor so finish
+    # nodes on disconnected footway fragments cannot be selected.
+    seed = next(iter(strip_nodes), None) if strip_nodes else None
+    main_component: set[tuple] | None = None
+    if seed is not None:
+        from collections import deque
+
+        q: deque[tuple] = deque([seed])
+        main_component = {seed}
+        while q:
+            cur = q.popleft()
+            for nb, _dist in adj.get(cur, []):
+                if nb not in main_component:
+                    main_component.add(nb)
+                    q.append(nb)
+
     def _candidates(
         radius: float,
         strip_limit: float | None = None,
     ) -> list[tuple[tuple, float, int]]:
         result = []
         for node in nodes:
+            if main_component is not None and node not in main_component:
+                continue
             if node in strip_nodes:
                 continue
             if abs(node[0] - strip_lon) < min_off_strip:
@@ -634,6 +656,16 @@ def _find_off_strip_poi_node(
                 degree = len(adj.get(node, []))
                 result.append((node, d, degree))
         return result
+
+    # If preferred landmark sits on the main graph, allow it / its nearest
+    # main-component neighbor even if it is on/near the corridor.
+    if preferred and preferred in landmarks and main_component is not None:
+        poi = landmarks[preferred]
+        if poi in main_component and poi in adj:
+            return poi
+        nearest_main = _find_closest_node(poi, main_component)
+        if nearest_main is not None and _haversine(poi, nearest_main) <= max_radius_mi * 2:
+            return nearest_main
 
     # Tier 1: near POI AND near Strip
     cands = _candidates(max_radius_mi, max_strip_dist_mi)
@@ -1367,6 +1399,113 @@ def _route_is_clean(route: list[tuple], strip_nodes: Set[tuple]) -> bool:
     return start_to_strip <= 0.5
 
 
+def _is_bangkok_network() -> bool:
+    """True when corridor center is in Thailand (eastern hemisphere)."""
+    return STRIP_CENTER[0] > 0
+
+
+def _active_target_dist_mi() -> float:
+    return BANGKOK_TARGET_DIST_MI if _is_bangkok_network() else TARGET_DIST_MI
+
+
+def _generate_park_connector_route(
+    adj: Dict[tuple, List[tuple]],
+    landmarks: Dict[str, tuple],
+    strip_nodes: Set[tuple],
+    rng: random.Random,
+    finish_landmark: str | None = None,
+) -> tuple[list[tuple], float]:
+    """Build a reliable urban park-connector route (Lumphini → Benjakitti).
+
+    Unlike zone-sweep (designed for Las Vegas scale), this chains landmark
+    waypoints with plain Dijkstra and optionally adds extra loops until the
+    Bangkok target distance (~10 km) is reached.
+    """
+    finish_name = finish_landmark or FINISH_LANDMARK
+    chain = [
+        CORRIDOR_START,
+        "Lumphini Park",
+        CORRIDOR_EXIT,
+        "The Green Mile",
+        "Green Bridge Midpoint",
+        finish_name,
+        "Queen Sirikit National Convention Center",
+        finish_name,
+    ]
+    # Optional second lap for distance
+    loop = [
+        finish_name,
+        CORRIDOR_EXIT,
+        "Lumphini Park",
+        CORRIDOR_START,
+        "Lumphini Park",
+        CORRIDOR_EXIT,
+        finish_name,
+    ]
+
+    def _snap(name: str) -> tuple | None:
+        if name not in landmarks:
+            return None
+        coord = landmarks[name]
+        if coord in adj:
+            return coord
+        return _find_closest_node(coord, set(adj.keys()))
+
+    waypoints: list[tuple] = []
+    for name in chain:
+        node = _snap(name)
+        if node and (not waypoints or node != waypoints[-1]):
+            waypoints.append(node)
+    if len(waypoints) < 2:
+        # Fallback: strip south → strip north → finish
+        sorted_strip = sorted(strip_nodes, key=lambda n: n[1])
+        if len(sorted_strip) >= 2:
+            waypoints = [sorted_strip[0], sorted_strip[-1]]
+            fin = _snap(finish_name)
+            if fin:
+                waypoints.append(fin)
+
+    target = _active_target_dist_mi()
+    route: list[tuple] = [waypoints[0]]
+    total = 0.0
+
+    def _append_leg(dst: tuple) -> bool:
+        nonlocal total
+        src = route[-1]
+        if src == dst:
+            return True
+        path, dist = _get_path_dijkstra(src, dst, adj, set(), set())
+        if not path or len(path) < 2:
+            return False
+        route.extend(path[1:])
+        total += dist
+        return True
+
+    for wp in waypoints[1:]:
+        if not _append_leg(wp):
+            continue
+
+    # Add loops until target (allow node reuse — dense city grid)
+    safety = 0
+    while total < target * 0.92 and safety < 6:
+        safety += 1
+        order = list(loop)
+        if rng.random() < 0.5:
+            order.reverse()
+        for name in order:
+            node = _snap(name)
+            if not node:
+                continue
+            if not _append_leg(node):
+                continue
+            if total >= target * 0.92:
+                break
+
+    if len(route) < 2:
+        return [], 0.0
+    return route, total
+
+
 def _generate_best_route(
     adj: Dict[tuple, List[tuple]],
     nodes: Set[tuple],
@@ -1391,10 +1530,26 @@ def _generate_best_route(
     if seed is None:
         seed = random.randrange(2**32)
 
+    # Bangkok park-connector network: use landmark-chain routing (fast, reliable)
+    if _is_bangkok_network():
+        rng = random.Random(seed)
+        route, dist = _generate_park_connector_route(
+            adj, landmarks, strip_nodes, rng, finish_landmark=finish_landmark
+        )
+        if route:
+            logger.info(
+                "PLANNER: Bangkok park-connector route %.3f mi (target %.3f mi / %.1f km)",
+                dist,
+                _active_target_dist_mi(),
+                _active_target_dist_mi() * 1.60934,
+            )
+            return route, dist
+
     best_route: list[tuple] = []
     best_dist = 0.0
     best_clean_route: list[tuple] = []
     best_clean_dist = 0.0
+    target = _active_target_dist_mi()
 
     for k in range(max_candidates):
         candidate_seed = seed * 1000 + k
@@ -1419,8 +1574,8 @@ def _generate_best_route(
             best_clean_route = route
             best_clean_dist = dist
 
-        # Early exit: clean marathon-distance route found
-        if clean and dist >= TARGET_DIST_MI:
+        # Early exit: clean target-distance route found
+        if clean and dist >= target:
             return route, dist
 
     # Prefer clean route even if shorter
@@ -1797,10 +1952,11 @@ async def plan_marathon_route(
     # Idempotency guard: return cached route if already planned (unless force_replan)
     if not force_replan and tool_context and tool_context.state.get("marathon_route"):
         logger.info("PLANNER: Route already planned, returning cached result.")
+        cached = tool_context.state["marathon_route"]
         return {
             "status": "already_planned",
-            "message": "Marathon route was already planned in this session. Use report_marathon_route to emit it.",
-            "geojson": tool_context.state["marathon_route"],
+            "message": "Marathon route was already planned in this session. Use report_marathon_route to emit the map.",
+            "summary": _route_summary_for_llm(cached),
         }
 
     logger.info("PLANNER: Generating marathon route...")
@@ -1905,10 +2061,16 @@ async def plan_marathon_route(
         if tool_context:
             tool_context.state["marathon_route"] = output
 
+        summary = _route_summary_for_llm(output)
         return {
             "status": "success",
-            "message": "Marathon route planned successfully including logistical stations.",
-            "geojson": output,
+            "message": (
+                "Marathon route planned successfully including logistical stations. "
+                f"Length ≈ {summary['distance_km']} km. "
+                "Call report_marathon_route to render the interactive map. "
+                "Do not dump raw GeoJSON into the reply."
+            ),
+            "summary": summary,
         }
     except Exception as e:
         logger.error(f"PLANNER: Error processing GeoJSON: {e}")
@@ -2253,12 +2415,181 @@ async def add_medical_tents(
     }
 
 
+def _route_geojson_to_leaflet_html(route_geojson: dict) -> str:
+    """Build a self-contained Leaflet HTML map for a route FeatureCollection."""
+    features = route_geojson.get("features") or []
+    lats: list[float] = []
+    lngs: list[float] = []
+
+    def _collect(coords, depth=0):
+        if not coords:
+            return
+        if isinstance(coords[0], (int, float)):
+            lngs.append(float(coords[0]))
+            lats.append(float(coords[1]))
+            return
+        for c in coords:
+            _collect(c, depth + 1)
+
+    for f in features:
+        geom = f.get("geometry") or {}
+        _collect(geom.get("coordinates"))
+
+    if lats and lngs:
+        center_lat = sum(lats) / len(lats)
+        center_lng = sum(lngs) / len(lngs)
+        bounds_js = json.dumps([[min(lats), min(lngs)], [max(lats), max(lngs)]])
+    else:
+        center_lat, center_lng = 13.7306, 100.5417
+        bounds_js = "null"
+
+    geojson_js = json.dumps(route_geojson, ensure_ascii=False)
+
+    return f"""<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Marathon Route Map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    html, body {{ margin: 0; padding: 0; height: 100%; font-family: system-ui, sans-serif; }}
+    #map {{ height: 100%; width: 100%; }}
+    .legend {{
+      background: white; padding: 8px 10px; border-radius: 6px;
+      box-shadow: 0 1px 4px rgba(0,0,0,.3); font-size: 12px; line-height: 1.5;
+    }}
+    .legend i {{
+      display: inline-block; width: 12px; height: 12px; margin-right: 6px;
+      border-radius: 50%; vertical-align: middle;
+    }}
+    .legend .line {{
+      display: inline-block; width: 16px; height: 4px; margin-right: 6px;
+      background: #e11d48; vertical-align: middle; border-radius: 2px;
+    }}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script>
+    const route = {geojson_js};
+    const map = L.map('map').setView([{center_lat}, {center_lng}], 14);
+    L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap'
+    }}).addTo(map);
+
+    function styleFeature(feature) {{
+      const t = (feature.properties && feature.properties['marker-type']) || '';
+      if (feature.geometry.type === 'LineString' || feature.geometry.type === 'MultiLineString') {{
+        return {{ color: '#e11d48', weight: 5, opacity: 0.9 }};
+      }}
+      return {{}};
+    }}
+
+    function pointColor(props) {{
+      const t = (props && props['marker-type']) || '';
+      const name = ((props && props.name) || '').toLowerCase();
+      if (t === 'start' || name.includes('start')) return '#16a34a';
+      if (t === 'finish' || name.includes('finish')) return '#dc2626';
+      if (t.includes('water') || t.includes('hydration') || name.includes('water')) return '#2563eb';
+      if (t.includes('medical') || name.includes('medical')) return '#7c3aed';
+      return '#f59e0b';
+    }}
+
+    function onEachFeature(feature, layer) {{
+      const p = feature.properties || {{}};
+      const title = p.name || p['marker-type'] || feature.geometry.type;
+      const bits = Object.entries(p)
+        .filter(([k]) => !['marker-symbol'].includes(k))
+        .map(([k, v]) => `<div><b>${{k}}</b>: ${{v}}</div>`)
+        .join('');
+      layer.bindPopup(`<strong>${{title}}</strong>${{bits}}`);
+    }}
+
+    const layer = L.geoJSON(route, {{
+      style: styleFeature,
+      pointToLayer: function(feature, latlng) {{
+        const color = pointColor(feature.properties || {{}});
+        return L.circleMarker(latlng, {{
+          radius: 7, color: '#fff', weight: 2, fillColor: color, fillOpacity: 0.95
+        }});
+      }},
+      onEachFeature: onEachFeature
+    }}).addTo(map);
+
+    const bounds = {bounds_js};
+    if (bounds) {{
+      map.fitBounds(bounds, {{ padding: [30, 30] }});
+    }} else if (layer.getBounds().isValid()) {{
+      map.fitBounds(layer.getBounds(), {{ padding: [30, 30] }});
+    }}
+
+    const legend = L.control({{ position: 'bottomleft' }});
+    legend.onAdd = function() {{
+      const div = L.DomUtil.create('div', 'legend');
+      div.innerHTML =
+        '<div><span class="line"></span>Route</div>' +
+        '<div><i style="background:#16a34a"></i>Start</div>' +
+        '<div><i style="background:#dc2626"></i>Finish</div>' +
+        '<div><i style="background:#2563eb"></i>Water</div>' +
+        '<div><i style="background:#7c3aed"></i>Medical</div>';
+      return div;
+    }};
+    legend.addTo(map);
+  </script>
+</body>
+</html>
+"""
+
+
+def _route_summary_for_llm(route_geojson: dict) -> dict:
+    """Compact route stats for LLM context — never return full GeoJSON to the model."""
+    features = route_geojson.get("features") or []
+    n_lines = sum(
+        1 for f in features if (f.get("geometry") or {}).get("type") == "LineString"
+    )
+    n_points = sum(
+        1 for f in features if (f.get("geometry") or {}).get("type") == "Point"
+    )
+    coords = _extract_route_coords(route_geojson)
+    dist_mi = 0.0
+    if len(coords) >= 2:
+        index = _build_distance_index(coords)
+        dist_mi = index[-1][1] if index else 0.0
+    dist_km = round(dist_mi * 1.60934, 2)
+    start = coords[0] if coords else None
+    finish = coords[-1] if coords else None
+    road_names = []
+    for f in features:
+        if (f.get("geometry") or {}).get("type") != "LineString":
+            continue
+        name = (f.get("properties") or {}).get("name")
+        if name and name not in road_names:
+            road_names.append(name)
+        if len(road_names) >= 12:
+            break
+    return {
+        "distance_km": dist_km,
+        "distance_mi": round(dist_mi, 3),
+        "feature_count": len(features),
+        "line_segments": n_lines,
+        "point_markers": n_points,
+        "start_lonlat": list(start) if start else None,
+        "finish_lonlat": list(finish) if finish else None,
+        "sample_roads": road_names,
+        "note": "Full GeoJSON is in session state / map artifact only — not returned here.",
+    }
+
+
 async def report_marathon_route(
     tool_context: ToolContext,
 ) -> dict:
-    """Report the final marathon route GeoJSON to the gateway for visualization.
+    """Report the final marathon route GeoJSON and render an interactive map.
 
-    Reads the route exclusively from session state (set by ``plan_marathon_route``).
+    Reads the route from session state (set by ``plan_marathon_route``), then
+    saves a Leaflet HTML map as an ADK artifact so ``adk web`` can display it.
 
     Args:
         tool_context: ADK tool context with session state containing ``marathon_route``.
@@ -2272,10 +2603,40 @@ async def report_marathon_route(
             "message": "No marathon route found. Run 'plan_marathon_route' first.",
         }
 
+    map_filename = "marathon_route_map.html"
+    try:
+        html = _route_geojson_to_leaflet_html(route_geojson)
+        artifact = types.Part(
+            inline_data=types.Blob(
+                mime_type="text/html",
+                data=html.encode("utf-8"),
+            )
+        )
+        version = await tool_context.save_artifact(
+            filename=map_filename,
+            artifact=artifact,
+        )
+        logger.info("PLANNER: Saved map artifact %s v%s", map_filename, version)
+        map_status = f"Interactive map saved as artifact '{map_filename}' (v{version})."
+    except Exception as e:
+        logger.exception("PLANNER: Failed to save map artifact")
+        map_status = f"Map artifact not saved: {e}"
+        map_filename = None
+        version = None
+
+    summary = _route_summary_for_llm(route_geojson)
     return {
         "status": "success",
-        "message": "Final marathon route reported to the system.",
-        "route_geojson": route_geojson,
+        "message": (
+            "Final marathon route reported. "
+            f"{map_status} "
+            "Open the HTML artifact in ADK Web to view the map. "
+            f"Route length ≈ {summary['distance_km']} km. "
+            "Describe distances to the user in kilometers (km)."
+        ),
+        "summary": summary,
+        "map_artifact": map_filename,
+        "map_artifact_version": version,
     }
 
 
