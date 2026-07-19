@@ -49,6 +49,8 @@ The agent progressively demonstrates capabilities such as well-structured system
     ```
     Access the UI at `http://127.0.0.1:8000`.
 
+ตัวอย่าง prompt ภาษาไทยอยู่ที่ [README หลัก](../README.md#ตัวอย่าง-prompt-ภาษาไทย)
+
 ## Deployment
 
 Deploy the agent to the Google Cloud Agent Engine securely:

@@ -34,12 +34,7 @@ adk web
 
 เลือก agent `app` แล้วลองคุยกับ agent
 
-## ตัวอย่างคำถาม
-
-1. `"I have a blog post titled 'Getting Started with Kubernetes'. Can you review it for SEO?"` — inline skill
-2. `"Help me write a short introduction for a blog about Python async programming. Make it SEO-friendly."` — blog-writer + seo-checklist
-3. `"Use your content research skill to help me research async Python"` — external / file skill + L3 resource
-4. `"I need a new skill for reviewing Python code for security vulnerabilities. Can you create a SKILL.md?"` — skill factory
+ตัวอย่าง prompt ภาษาไทยอยู่ที่ [README หลัก](../README.md#ตัวอย่าง-prompt-ภาษาไทย)
 
 ## โครงสร้างโปรเจกต์
 
