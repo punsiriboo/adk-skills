@@ -60,6 +60,14 @@ cp marathon_planner_agent/sample.env marathon_planner_agent/.env
 adk web
 ```
 
+for github codespace 
+```bash
+adk web . \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --allow_origins "*"
+```
+
 เปิด `http://127.0.0.1:8000` แล้วเลือก agent ที่ต้องการ
 
 ## Project Structure
